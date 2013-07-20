@@ -20,5 +20,7 @@ install: all
 	@mkdir -p ${DESTDIR}${PREFIX}/bin
 	@cp -f keystroked ${DESTDIR}${PREFIX}/bin
 	@chmod 755 ${DESTDIR}${PREFIX}/bin/keystroked
+	@cp -f keystroke.service /etc/systemd/system/keystroke.service
+	@chmod 644 /etc/systemd/system/keystroke.service
 uninstall:
 	@rm -f ${DESTDIR}${PREFIX}/bin/keystroked 

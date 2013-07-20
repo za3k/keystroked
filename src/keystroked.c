@@ -4,7 +4,7 @@
     *
     *   Options: 
     *   -t iteration_time, defaul 60 sec
-    *   -f logfile_name, default /etc/keystrokes.log
+    *   -f logfile_name, default /var/log/keystroked/keystrokes.log
     *   -d path-to-device, default /dev/input/event0
     *
     */
