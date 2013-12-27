@@ -89,6 +89,7 @@
         
         while (1) {
             end = time(NULL);
+            sleep(1);
             if (difftime(end, start) < itertime){ 
         
                 int c = read(device, &ev, sizeof(struct input_event));
