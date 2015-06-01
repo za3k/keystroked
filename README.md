@@ -1,7 +1,7 @@
 # keystroked
 Productivity monitor for keyboard activity in linux. Logs whether there was keyboard activity or not, each minute.
 
-If you're on mac this won't work. [hours](https://github.com/vanceza/short-programs), is alternative approach which only looks at bash commands.
+If you're on mac this won't work. [hours](https://github.com/vanceza/short-programs) uses an alternative approach which only looks at bash commands.
 
     Options
       -t iteration_time, default 60 sec
