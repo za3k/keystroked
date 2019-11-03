@@ -1,0 +1,220 @@
+#!/usr/bin/python3
+# Usage: summarize_activity [MIN_IDLE MIN_ACTIVE [START [END]]]
+# Where MIN_IDLE gives the maximum idle length before an 'activity' period ends in minutes
+#       MIN_ACTIVE gives the minimum activity length which will be reported in minutes
+#       START is a day-based offset from now (-1 is yesterday, 0 today)
+#       END   is in the same format
+import sys
+from datetime import datetime, time, timedelta
+
+def parse_entries(path='/var/log/keystroked/keystrokes.log'):
+    entries = {}
+    num_sessions = 0
+    last_ts = 0
+    monotonic_violations = 0
+    slow_updates = 0
+    with open(path, 'r') as f:
+        for line in f:
+            if line.startswith("keyboard "):
+                _, ts, keystrokes = line.split()
+                assert len(ts) == 10
+                ts, keystrokes = int(ts), int(keystrokes)
+                # Not always monotonic
+                if last_ts > ts:
+                    monotonic_violations += 1
+                elif last_ts + 120 < ts:
+                    slow_updates += 1
+                last_ts = ts
+                entries[ts] = keystrokes
+            elif line == '':
+                pass
+            elif "Started" in line:
+                num_sessions += 1
+                ts = 0
+            else:
+                assert False
+    assert monotonic_violations <= 1 # One known violation, presumably setting system clock while logger running--should generally be low number.
+    print("{} entries in {} sessions".format(len(entries), num_sessions))
+    print("{} monotonicity violations".format(monotonic_violations))
+    print("{} slow updates (120+s)".format(slow_updates))
+    for ts in sorted(entries.keys()):
+        yield (ts, entries[ts])
+
+class RANGE_TYPES:
+    ACTIVITY=1
+    NO_ACTIVITY=2
+    NOT_RECORDED=3
+
+def entries_to_ranges(entries):
+    for ts, keystrokes in entries:
+        if keystrokes == 0:
+            yield (ts-60, ts, RANGE_TYPES.NO_ACTIVITY)
+        else:
+            yield (ts-60, ts, RANGE_TYPES.ACTIVITY)
+        
+def combine_ranges(ranges):
+    it = iter(ranges)
+    in_progress = next(it)
+    last_complete = None
+    for r in it:
+        res = combine_2ranges(in_progress, r)
+        if len(res) == 1:
+            in_progress = res[0]
+        elif len(res) >= 2:
+            for r in res[:-1]:
+                if last_complete is None:
+                    last_complete = r
+                else:
+                    assert last_complete[1]==r[0]
+                    last_complete = r
+                yield r
+            in_progress = res[-1]
+        else:
+            assert False
+    assert last_complete[1]==in_progress[0]
+    yield in_progress
+
+COLLAPSE_NO_ACTIVITY = 120 # seconds of not-recorded time which can be removed between 2 non-activity bits (and assumed non-activity)
+COLLAPSE_ACTIVITY = 120 # seconds of not-recorded time which can be removed between 2 activity bits (and assumed activity)
+COLLAPSE_ACTIVITY_TO_NO = 120 # seconds between activity and non-activity which can be removed
+COLLAPSE_NO_TO_ACTIVITY = 120 # seconds between non-activity and activity which can be removed
+def combine_2ranges(r1, r2):
+    start_ts1, end_ts1, r1_type = r1
+    start_ts2, end_ts2, r2_type = r2
+    assert start_ts1 <= end_ts1, "Invalid range 1"
+    assert start_ts2 <= end_ts2, "Invalid range 2"
+    assert start_ts1 <= start_ts2, "Range ordering invalid"
+    assert end_ts1 <= end_ts2, "Range ordering invalid"
+    overlap = (end_ts1 > start_ts2)
+    if r1_type == RANGE_TYPES.NOT_RECORDED and r2_type == RANGE_TYPES.NOT_RECORDED:
+        # One big ?
+        return [(start_ts1, end_ts2, RANGE_TYPES.NOT_RECORDED)]
+    elif r1_type == RANGE_TYPES.NOT_RECORDED:
+        # Pad "not recorded" up the right end
+        return [(start_ts1, start_ts2, RANGE_TYPES.NOT_RECORDED),
+               r2]
+    elif r2_type == RANGE_TYPES.NOT_RECORDED:
+        # Pad "not recorded" up the left end
+        return [r1, (end_ts1, end_ts2, RANGE_TYPES.NOT_RECORDED)]
+    elif r1_type == RANGE_TYPES.NO_ACTIVITY and r2_type == RANGE_TYPES.NO_ACTIVITY:
+        if end_ts1+COLLAPSE_NO_ACTIVITY < start_ts2: # if there's a big gap
+            return [r1, (end_ts1, start_ts2, RANGE_TYPES.NOT_RECORDED), r2]
+        else:
+            return [(start_ts1, end_ts2, RANGE_TYPES.NO_ACTIVITY)]
+    elif r1_type == RANGE_TYPES.ACTIVITY and r2_type == RANGE_TYPES.ACTIVITY:
+        if end_ts1+COLLAPSE_ACTIVITY < start_ts2: # if there's a big gap
+            return [r1, (end_ts1, start_ts2, RANGE_TYPES.NOT_RECORDED), r2]
+        else:
+            return[(start_ts1, end_ts2, RANGE_TYPES.ACTIVITY)]
+    elif r1_type == RANGE_TYPES.ACTIVITY and r2_type == RANGE_TYPES.NO_ACTIVITY:
+        if end_ts1+COLLAPSE_ACTIVITY_TO_NO < start_ts2: # if there's a big gap
+            return [r1, (end_ts1, start_ts2, RANGE_TYPES.NOT_RECORDED), r2]
+        elif overlap:
+            # 'activity' wins. also this indicates a problem, probably
+            return [r1, (end_ts1, end_ts2, RANGE_TYPES.NO_ACTIVITY)]
+        else:
+            # 'no activity' gets the middle gap
+            return [r1, (end_ts1, end_ts2, RANGE_TYPES.NO_ACTIVITY)]
+    elif r1_type == RANGE_TYPES.NO_ACTIVITY and r2_type == RANGE_TYPES.ACTIVITY:
+        if end_ts1+COLLAPSE_NO_TO_ACTIVITY < start_ts2: # if there's a big gap
+            return [r1, (end_ts1, start_ts2, RANGE_TYPES.NOT_RECORDED), r2]
+        elif overlap:
+            # 'activity' wins. also this indicates a problem, probably
+            return [(start_ts1, start_ts2, RANGE_TYPES.NO_ACTIVITY), r2]
+        else:
+            # 'no activity' gets the middle gap
+            return [(start_ts1, start_ts2, RANGE_TYPES.NO_ACTIVITY), r2]
+    else:
+        assert False
+
+def pairs(l):
+    it = iter(l)
+    last = next(it)
+    for x in it:
+        yield (last, x)
+        last = x
+def check_partitions(partitions):
+    return all((p1[0] < p1[1] == p2[0] < p2[1]) and p1[2]!=p2[2] for p1,p2 in pairs(partitions))
+
+def summarize_activity(partitions, remove_gaps_size=60*30, remove_activity_min_size=0):
+    activity_partitions = (p for p in partitions if p[2] == RANGE_TYPES.ACTIVITY)
+    it = iter(activity_partitions)
+    in_progress = next(it)
+    for r in it:
+        res = summarize_2activity(in_progress, r, remove_gaps_size)
+        if len(res) == 1:
+            in_progress = res[0]
+        elif len(res) >= 2:
+            for r in res[:-1]:
+                if r[1]-r[0] >= remove_activity_min_size:
+                    yield r
+            in_progress = res[-1]
+        else:
+            assert False
+    yield in_progress
+    
+def summarize_2activity(p1, p2, remove_gaps_size):
+    start_ts1, end_ts1, pt1 = p1
+    start_ts2, end_ts2, pt2 = p2
+    assert pt1==pt2
+    if end_ts1 + remove_gaps_size >= start_ts2:
+        return [(start_ts1, end_ts2, pt1)]
+    else:
+        return [p1,p2]
+
+def restrict_report(partitions, min_ts, max_ts):
+    for p in partitions:
+        if min_ts <= p[1] and p[0] <= max_ts:
+            yield p
+    
+partitions = combine_ranges(entries_to_ranges(parse_entries()))
+partitions = list(partitions)
+start_ts, end_ts = min(p[0] for p in partitions), max(p[1] for p in partitions)
+
+# CLI time range restriction
+# Defaults to today + yesterday
+midnight = datetime.combine(datetime.today(), time.min)
+epoch = datetime.fromtimestamp(0)
+if len(sys.argv) >= 3:
+    days = int(sys.argv[3])
+    assert days <= 0
+    min_t = midnight + timedelta(days=days)
+    min_ts = (min_t-epoch).total_seconds()
+else:
+    #days = -1
+    #assert days <= 0
+    #min_t = midnight + timedelta(days=days)
+    #min_ts = (min_t-epoch).total_seconds()
+    min_ts = start_ts-1
+if len(sys.argv) >= 4:
+    days = int(sys.argv[4])
+    assert days <= 0
+    max_t = midnight + timedelta(days=days+1)
+    max_ts = (max_t-epoch).total_seconds()
+else:
+    max_ts = end_ts+1
+start_ts, end_ts = max(min_ts, start_ts), min(max_ts, end_ts)
+
+if len(sys.argv) >= 2:
+    max_inactive = int(sys.argv[1]) * 60
+    min_active = int(sys.argv[2]) * 60
+else:
+    max_inactive = 60*30 # 30 minutes is the default merge window
+    min_active = 60*10
+
+assert check_partitions(partitions)
+partitions = restrict_report(partitions, min_ts, max_ts)
+partitions = list(partitions)
+assert check_partitions(partitions)
+summarized_partitions = summarize_activity(partitions, max_inactive, min_active)
+
+def print_period(start_ts, end_ts, label=None):
+    start_t, end_t = datetime.fromtimestamp(start_ts), datetime.fromtimestamp(end_ts)
+    print("{:14} {} - {} ({:>8}s)".format(label+":", start_t, end_t, str(end_t-start_t)))
+
+print_period(start_ts, end_ts, "Report period")
+for start_ts, end_ts, range_type in summarized_partitions:
+    label = { RANGE_TYPES.ACTIVITY: "Active"
+            , RANGE_TYPES.NO_ACTIVITY: "Inactive"
+            , RANGE_TYPES.NOT_RECORDED: "?" }[range_type]
+    print_period(start_ts, end_ts, label)
