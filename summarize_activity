@@ -1,11 +1,16 @@
 #!/usr/bin/python3
-# Usage: summarize_activity [MIN_IDLE MIN_ACTIVE [START [END]]]
+# Usage: summarize_activity [MIN_IDLE MIN_ACTIVE [START [END [SPECIAL]]]]
 # Where MIN_IDLE gives the maximum idle length before an 'activity' period ends in minutes
 #       MIN_ACTIVE gives the minimum activity length which will be reported in minutes
 #       START is a day-based offset from now (-1 is yesterday, 0 today)
 #       END   is in the same format
+#       SPECIAL is a keyword that indicates special processing should be done
+#           INVERT - show periods of no activity
+#           SLEEP1 - show longest period of no activity only
 import sys
 from datetime import datetime, time, timedelta
+
+DEBUG=False
 
 def parse_entries(path='/var/log/keystroked/keystrokes.log'):
     entries = {}
@@ -34,9 +39,10 @@ def parse_entries(path='/var/log/keystroked/keystrokes.log'):
             else:
                 assert False
     assert monotonic_violations <= 1 # One known violation, presumably setting system clock while logger running--should generally be low number.
-    print("{} entries in {} sessions".format(len(entries), num_sessions))
-    print("{} monotonicity violations".format(monotonic_violations))
-    print("{} slow updates (120+s)".format(slow_updates))
+    if DEBUG:
+        print("{} entries in {} sessions".format(len(entries), num_sessions))
+        print("{} monotonicity violations".format(monotonic_violations))
+        print("{} slow updates (120+s)".format(slow_updates))
     for ts in sorted(entries.keys()):
         yield (ts, entries[ts])
 
@@ -166,6 +172,11 @@ def restrict_report(partitions, min_ts, max_ts):
     for p in partitions:
         if min_ts <= p[1] and p[0] <= max_ts:
             yield p
+
+def invert_activity(partitions):
+    assert all(p[2] == RANGE_TYPES.ACTIVITY for p in partitions)
+    for p1,p2 in pairs(partitions):
+        yield (p1[1], p2[0], RANGE_TYPES.NO_ACTIVITY)
     
 partitions = combine_ranges(entries_to_ranges(parse_entries()))
 partitions = list(partitions)
@@ -175,7 +186,7 @@ start_ts, end_ts = min(p[0] for p in partitions), max(p[1] for p in partitions)
 # Defaults to today + yesterday
 midnight = datetime.combine(datetime.today(), time.min)
 epoch = datetime.fromtimestamp(0)
-if len(sys.argv) >= 3:
+if len(sys.argv) > 3:
     days = int(sys.argv[3])
     assert days <= 0
     min_t = midnight + timedelta(days=days)
@@ -186,7 +197,7 @@ else:
     #min_t = midnight + timedelta(days=days)
     #min_ts = (min_t-epoch).total_seconds()
     min_ts = start_ts-1
-if len(sys.argv) >= 4:
+if len(sys.argv) > 4:
     days = int(sys.argv[4])
     assert days <= 0
     max_t = midnight + timedelta(days=days+1)
@@ -195,18 +206,26 @@ else:
     max_ts = end_ts+1
 start_ts, end_ts = max(min_ts, start_ts), min(max_ts, end_ts)
 
-if len(sys.argv) >= 2:
+if len(sys.argv) > 2:
     max_inactive = int(sys.argv[1]) * 60
     min_active = int(sys.argv[2]) * 60
 else:
     max_inactive = 60*30 # 30 minutes is the default merge window
     min_active = 60*10
+special = None
+if len(sys.argv) > 5:
+    special = sys.argv[5]
 
 assert check_partitions(partitions)
 partitions = restrict_report(partitions, min_ts, max_ts)
 partitions = list(partitions)
 assert check_partitions(partitions)
-summarized_partitions = summarize_activity(partitions, max_inactive, min_active)
+summarized_partitions = list(summarize_activity(partitions, max_inactive, min_active))
+
+if special in ("INVERT", "SLEEP1"):
+    summarized_partitions = list(invert_activity(summarized_partitions))
+if special == "SLEEP1":
+    summarized_partitions = [max(summarized_partitions, key=lambda p: p[1]-p[0])]
 
 def print_period(start_ts, end_ts, label=None):
     start_t, end_t = datetime.fromtimestamp(start_ts), datetime.fromtimestamp(end_ts)
