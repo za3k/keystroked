@@ -146,14 +146,16 @@ def summarize_activity(partitions, remove_gaps_size=60*30, remove_activity_min_s
     activity_partitions = (p for p in partitions if p[2] == RANGE_TYPES.ACTIVITY)
     it = iter(activity_partitions)
     in_progress = next(it)
+    first_reported = False
     for r in it:
         res = summarize_2activity(in_progress, r, remove_gaps_size)
         if len(res) == 1:
             in_progress = res[0]
         elif len(res) >= 2:
             for r in res[:-1]:
-                if r[1]-r[0] >= remove_activity_min_size:
+                if r[1]-r[0] >= remove_activity_min_size or not first_reported:
                     yield r
+                    first_reported = True
             in_progress = res[-1]
         else:
             assert False
