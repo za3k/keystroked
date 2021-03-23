@@ -38,7 +38,7 @@ def parse_entries(path='/var/log/keystroked/keystrokes.log'):
                 ts = 0
             else:
                 assert False
-    assert monotonic_violations <= 1 # One known violation, presumably setting system clock while logger running--should generally be low number.
+    assert monotonic_violations <= 2 # One known violation, presumably setting system clock while logger running--should generally be low number.
     if DEBUG:
         print("{} entries in {} sessions".format(len(entries), num_sessions))
         print("{} monotonicity violations".format(monotonic_violations))
