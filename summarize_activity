@@ -1,12 +1,20 @@
 #!/usr/bin/python3
-# Usage: summarize_activity [MIN_IDLE MIN_ACTIVE [START [END [SPECIAL]]]]
-# Where MIN_IDLE gives the maximum idle length before an 'activity' period ends in minutes
-#       MIN_ACTIVE gives the minimum activity length which will be reported in minutes
-#       START is a day-based offset from now (-1 is yesterday, 0 today)
-#       END   is in the same format
-#       SPECIAL is a keyword that indicates special processing should be done
-#           INVERT - show periods of no activity
-#           SLEEP1 - show longest period of no activity only
+USAGE = """
+ Usage: summarize_activity [OPTIONS]
+        summarize_activity DATE [OPTIONS]
+        summarize_activity START_DATE END_DATE [OPTIONS]
+ 
+        START is a day-based offset from now (-1 is yesterday, 0 today) or a date (2022-04-07)
+        END   is in the same format
+        DATE  is in the same format, and indicates time is restricted to one day
+
+        -h                              prints this mesage
+        --min-active-minutes MIN_ACTIVE gives the minimum activity length which will be reported
+        --max-inactive-minutes MAX_IDLE gives the maximum idle length before an 'activity' period ends
+        --mode MODE                     is a keyword that indicates special processing should be done
+               INVERT - show periods of no activity
+               SLEEP1 - show longest period of no activity only
+"""
 import sys
 from datetime import datetime, time, timedelta
 
@@ -38,7 +46,7 @@ def parse_entries(path='/var/log/keystroked/keystrokes.log'):
                 ts = 0
             else:
                 assert False
-    assert monotonic_violations <= 2 # One known violation, presumably setting system clock while logger running--should generally be low number.
+    assert monotonic_violations <= 3 # One known violation, presumably setting system clock while logger running--should generally be low number.
     if DEBUG:
         print("{} entries in {} sessions".format(len(entries), num_sessions))
         print("{} monotonicity violations".format(monotonic_violations))
@@ -179,63 +187,94 @@ def invert_activity(partitions):
     assert all(p[2] == RANGE_TYPES.ACTIVITY for p in partitions)
     for p1,p2 in pairs(partitions):
         yield (p1[1], p2[0], RANGE_TYPES.NO_ACTIVITY)
+
+FLAGS = { "help": "h" }
+def parse_args(args, flags=FLAGS):
+    pos_args = []
+    key_args = {}
+    flag_args = set()
+    while len(args) > 0:
+        arg, args = args[0], args[1:]
+        if arg == "--":
+            pos_args, args = pos_args + args, []
+        elif arg.startswith("--") and arg[2:] in flags:
+            flag_args.add(flags[arg[2:]])
+        elif arg.startswith("--"):
+            key_args[arg[2:]], args = args[0], args[1:]
+        elif arg.startswith("-"):
+            flag_args.add(arg[1:])
+        else:
+            pos_args.append(arg)
+    return pos_args, flag_args, key_args
     
-partitions = combine_ranges(entries_to_ranges(parse_entries()))
-partitions = list(partitions)
-start_ts, end_ts = min(p[0] for p in partitions), max(p[1] for p in partitions)
+if __name__ == "__main__":
+    # Parse the CLI args
+    pos_args, flag_args, key_args = parse_args(sys.argv[1:])
+    if "h" in flag_args or "help" in flag_args:
+        print(USAGE)
+        sys.exit(0)
+    assert len(flag_args) == 0
 
-# CLI time range restriction
-# Defaults to today + yesterday
-midnight = datetime.combine(datetime.today(), time.min)
-epoch = datetime.fromtimestamp(0)
-if len(sys.argv) > 3:
-    days = int(sys.argv[3])
-    assert days <= 0
-    min_t = midnight + timedelta(days=days)
-    min_ts = (min_t-epoch).total_seconds()
-else:
-    #days = -1
-    #assert days <= 0
-    #min_t = midnight + timedelta(days=days)
-    #min_ts = (min_t-epoch).total_seconds()
-    min_ts = start_ts-1
-if len(sys.argv) > 4:
-    days = int(sys.argv[4])
-    assert days <= 0
-    max_t = midnight + timedelta(days=days+1)
-    max_ts = (max_t-epoch).total_seconds()
-else:
-    max_ts = end_ts+1
-start_ts, end_ts = max(min_ts, start_ts), min(max_ts, end_ts)
+    # Load the data
+    partitions = combine_ranges(entries_to_ranges(parse_entries()))
+    partitions = list(partitions)
+    start_ts, end_ts = min(p[0] for p in partitions), max(p[1] for p in partitions)
 
-if len(sys.argv) > 2:
-    max_inactive = int(sys.argv[1]) * 60
-    min_active = int(sys.argv[2]) * 60
-else:
+    # Interpret the CLI args
+    epoch = datetime.fromtimestamp(0)
+    def parse_date(str_date, end=False):
+        """Return a datetime, and seconds as a unix timestamp."""
+        if not end:
+            midnight = datetime.combine(datetime.today(), time.min)
+        else:
+            midnight = datetime.combine(datetime.today(), time.max).replace(microsecond=0)
+        try: # 0 = today, -1 = yesterday, etc
+            days = int(str_date)
+            assert days <= 0
+            dt = midnight + timedelta(days=days)
+        except ValueError:
+            date = datetime.strptime(str_date, "%Y-%m-%d")
+            dt = datetime.combine(date.date(), midnight.time())
+        return dt, (dt-epoch).total_seconds()
+
+
+    if len(pos_args) == 0: # All of time
+        min_ts, max_ts = start_ts-1, end_ts+1
+    elif len(pos_args) == 1: # Check one day
+        (min_t, min_ts), (max_t, max_ts) = parse_date(pos_args[0]), parse_date(pos_args[0], end=True)
+    elif len(pos_args) == 2: # Check date range
+        (min_t, min_ts), (max_t, max_ts) = parse_date(pos_args[0]), parse_date(pos_args[1], end=True)
+    start_ts, end_ts = max(min_ts, start_ts), min(max_ts, end_ts)
+
     max_inactive = 60*30 # 30 minutes is the default merge window
     min_active = 60*10
-special = None
-if len(sys.argv) > 5:
-    special = sys.argv[5]
+    if "inactive-minutes" in key_args:
+        max_inactive = int(key_args["inactive-minutes"]) * 60
+    if "active-minutes" in key_args:
+        min_active = int(key_args["active-minutes"]) * 60
 
-assert check_partitions(partitions)
-partitions = restrict_report(partitions, min_ts, max_ts)
-partitions = list(partitions)
-assert check_partitions(partitions)
-summarized_partitions = list(summarize_activity(partitions, max_inactive, min_active))
+    mode = key_args.get("mode", None)
 
-if special in ("INVERT", "SLEEP1"):
-    summarized_partitions = list(invert_activity(summarized_partitions))
-if special == "SLEEP1":
-    summarized_partitions = [max(summarized_partitions, key=lambda p: p[1]-p[0])]
+    # Calculate the answer
+    assert check_partitions(partitions)
+    partitions = restrict_report(partitions, min_ts, max_ts)
+    partitions = list(partitions)
+    assert check_partitions(partitions)
+    summarized_partitions = list(summarize_activity(partitions, max_inactive, min_active))
 
-def print_period(start_ts, end_ts, label=None):
-    start_t, end_t = datetime.fromtimestamp(start_ts), datetime.fromtimestamp(end_ts)
-    print("{:14} {} - {} ({:>8}s)".format(label+":", start_t, end_t, str(end_t-start_t)))
+    if mode in ("INVERT", "SLEEP1"):
+        summarized_partitions = list(invert_activity(summarized_partitions))
+    if mode == "SLEEP1":
+        summarized_partitions = [max(summarized_partitions, key=lambda p: p[1]-p[0])]
 
-print_period(start_ts, end_ts, "Report period")
-for start_ts, end_ts, range_type in summarized_partitions:
-    label = { RANGE_TYPES.ACTIVITY: "Active"
-            , RANGE_TYPES.NO_ACTIVITY: "Inactive"
-            , RANGE_TYPES.NOT_RECORDED: "?" }[range_type]
-    print_period(start_ts, end_ts, label)
+    # Print the answer
+    def print_period(start_ts, end_ts, label=None):
+        start_t, end_t = datetime.fromtimestamp(start_ts), datetime.fromtimestamp(end_ts)
+        print("{:14} {} - {} ({:>8}s)".format(label+":", start_t, end_t, str(end_t-start_t)))
+
+    print_period(start_ts, end_ts, "Report period")
+    for start_ts, end_ts, range_type in summarized_partitions:
+        label = { RANGE_TYPES.ACTIVITY: "Active"
+                , RANGE_TYPES.NO_ACTIVITY: "Inactive"
+                , RANGE_TYPES.NOT_RECORDED: "?" }[range_type]
+        print_period(start_ts, end_ts, label)
