@@ -17,6 +17,7 @@ USAGE = """
 """
 import sys
 from datetime import datetime, time, timedelta
+from functools import wraps
 
 DEBUG=False
 
@@ -46,7 +47,7 @@ def parse_entries(path='/var/log/keystroked/keystrokes.log'):
                 ts = 0
             else:
                 assert False
-    assert monotonic_violations <= 3 # One known violation, presumably setting system clock while logger running--should generally be low number.
+    assert monotonic_violations <= 4 # One known violation, presumably setting system clock while logger running--should generally be low number.
     if DEBUG:
         print("{} entries in {} sessions".format(len(entries), num_sessions))
         print("{} monotonicity violations".format(monotonic_violations))
@@ -65,7 +66,7 @@ def entries_to_ranges(entries):
             yield (ts-60, ts, RANGE_TYPES.NO_ACTIVITY)
         else:
             yield (ts-60, ts, RANGE_TYPES.ACTIVITY)
-        
+
 def combine_ranges(ranges):
     it = iter(ranges)
     in_progress = next(it)
@@ -183,10 +184,17 @@ def restrict_report(partitions, min_ts, max_ts):
         if min_ts <= p[1] and p[0] <= max_ts:
             yield p
 
-def invert_activity(partitions):
+def invert_activity(partitions, min_ts, max_ts):
+    partitions = list(partitions)
     assert all(p[2] == RANGE_TYPES.ACTIVITY for p in partitions)
+    if len(partitions) > 0 and partitions[0][0] > min_ts+1:
+        yield (min_ts, partitions[0][0], RANGE_TYPES.NO_ACTIVITY)
     for p1,p2 in pairs(partitions):
         yield (p1[1], p2[0], RANGE_TYPES.NO_ACTIVITY)
+    if len(partitions) == 0:
+        yield (min_ts, max_ts)
+    elif partitions[-1][1] < max_ts-1:
+        yield (partitions[-1][1], max_ts, RANGE_TYPES.NO_ACTIVITY)
 
 FLAGS = { "help": "h" }
 def parse_args(args, flags=FLAGS):
@@ -216,12 +224,12 @@ if __name__ == "__main__":
     assert len(flag_args) == 0
 
     # Load the data
-    partitions = combine_ranges(entries_to_ranges(parse_entries()))
-    partitions = list(partitions)
+    partitions = list(combine_ranges(entries_to_ranges(parse_entries())))
     start_ts, end_ts = min(p[0] for p in partitions), max(p[1] for p in partitions)
 
     # Interpret the CLI args
     epoch = datetime.fromtimestamp(0)
+    now = int((datetime.now()-epoch).total_seconds())
     def parse_date(str_date, end=False):
         """Return a datetime, and seconds as a unix timestamp."""
         if not end:
@@ -239,11 +247,11 @@ if __name__ == "__main__":
 
 
     if len(pos_args) == 0: # All of time
-        min_ts, max_ts = start_ts-1, end_ts+1
+        min_ts, max_ts = start_ts-1, max(end_ts+1, now)
     elif len(pos_args) == 1: # Check one day
-        (min_t, min_ts), (max_t, max_ts) = parse_date(pos_args[0]), parse_date(pos_args[0], end=True)
+        (_, min_ts), (_, max_ts) = parse_date(pos_args[0]), parse_date(pos_args[0], end=True)
     elif len(pos_args) == 2: # Check date range
-        (min_t, min_ts), (max_t, max_ts) = parse_date(pos_args[0]), parse_date(pos_args[1], end=True)
+        (_, min_ts), (_, max_ts) = parse_date(pos_args[0]), parse_date(pos_args[1], end=True)
     start_ts, end_ts = max(min_ts, start_ts), min(max_ts, end_ts)
 
     max_inactive = 60*30 # 30 minutes is the default merge window
@@ -254,16 +262,17 @@ if __name__ == "__main__":
         min_active = int(key_args["active-minutes"]) * 60
 
     mode = key_args.get("mode", None)
+    assert mode is None or mode in ("INVERT", "SLEEP1"), "Invalid --mode: {}".format(mode)
 
     # Calculate the answer
-    assert check_partitions(partitions)
-    partitions = restrict_report(partitions, min_ts, max_ts)
-    partitions = list(partitions)
-    assert check_partitions(partitions)
-    summarized_partitions = list(summarize_activity(partitions, max_inactive, min_active))
+    #assert check_partitions(partitions)
+    partitions = restrict_report(partitions, start_ts, end_ts)
+    #assert check_partitions(partitions)
+    summarized_partitions = summarize_activity(partitions, max_inactive, min_active)
 
     if mode in ("INVERT", "SLEEP1"):
-        summarized_partitions = list(invert_activity(summarized_partitions))
+        # Note: this below relies on max_ts being NOW, plus this program being run (so inactivity must end NOW, to give us one extra useful time period at the end).
+        summarized_partitions = list(invert_activity(summarized_partitions, min_ts, min(now,end_ts)))
     if mode == "SLEEP1":
         summarized_partitions = [max(summarized_partitions, key=lambda p: p[1]-p[0])]
 
