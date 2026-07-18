@@ -14,6 +14,8 @@ USAGE = """
         --mode MODE                     is a keyword that indicates special processing should be done
                INVERT - show periods of no activity
                SLEEP1 - show longest period of no activity only
+               SLEEP  - show likely sleep periods; any 24h+ stretch without
+                        detected sleep is shown in full instead, marked '?'
 """
 import sys
 from datetime import datetime, time, timedelta
@@ -59,6 +61,7 @@ class RANGE_TYPES:
     ACTIVITY=1
     NO_ACTIVITY=2
     NOT_RECORDED=3
+    SLEEP=4
 
 def entries_to_ranges(entries):
     for ts, keystrokes in entries:
@@ -196,6 +199,44 @@ def invert_activity(partitions, min_ts, max_ts):
     elif partitions[-1][1] < max_ts-1:
         yield (partitions[-1][1], max_ts, RANGE_TYPES.NO_ACTIVITY)
 
+# --- SLEEP mode: filter inverted (inactivity) periods down to likely sleep ---
+SLEEP_SURE    = 6*3600      # long enough to be sleep on its own
+SLEEP_MAX     = 14*3600     # longer is absence, not sleep -> '?'
+SLEEP_MAYBE   = 7*1800      # 3.5h: can be sleep, if at a plausible hour
+CIRCADIAN_TOL = 3*3600      # +/- around TYPICAL_MIDPOINT
+MAX_AWAKE     = 24*3600     # sleepless stretch -> report everything in it
+TYPICAL_MIDPOINT = 6*3600   # 06:00 local (learned 2026-07 from 2514 ranges)
+
+def is_sleep(p):
+    start_ts, end_ts = p[0], p[1]
+    dur = end_ts - start_ts
+    if not (SLEEP_MAYBE <= dur <= SLEEP_MAX):
+        return False
+    if dur >= SLEEP_SURE:
+        return True
+    # 3.5h-6h counts only if it sits at a plausible time of day
+    mid = datetime.fromtimestamp((start_ts + end_ts) // 2)
+    midnight = mid.replace(hour=0, minute=0, second=0, microsecond=0)
+    off = abs((mid - midnight).total_seconds() - TYPICAL_MIDPOINT) % 86400
+    return min(off, 86400 - off) <= CIRCADIAN_TOL
+
+def filter_sleep(partitions, min_ts, max_ts):
+    """Keep sleep periods. Fail open: a stretch of MAX_AWAKE+ containing no
+    detected sleep probably hides one, so everything inside it is kept and
+    labeled '?' for manual judgement."""
+    partitions = list(partitions)
+    windows = [] # sleepless stretches longer than MAX_AWAKE
+    cursor = min_ts
+    for start_ts, end_ts, _ in [p for p in partitions if is_sleep(p)] + [(max_ts, max_ts, None)]:
+        if start_ts - cursor > MAX_AWAKE:
+            windows.append((cursor, start_ts))
+        cursor = end_ts
+    for p in partitions:
+        if is_sleep(p):
+            yield (p[0], p[1], RANGE_TYPES.SLEEP)
+        elif any(w[0] <= p[0] and p[1] <= w[1] for w in windows):
+            yield (p[0], p[1], RANGE_TYPES.NOT_RECORDED)
+
 FLAGS = { "help": "h" }
 def parse_args(args, flags=FLAGS):
     pos_args = []
@@ -262,7 +303,7 @@ if __name__ == "__main__":
         min_active = int(key_args["active-minutes"]) * 60
 
     mode = key_args.get("mode", None)
-    assert mode is None or mode in ("INVERT", "SLEEP1"), "Invalid --mode: {}".format(mode)
+    assert mode is None or mode in ("INVERT", "SLEEP1", "SLEEP"), "Invalid --mode: {}".format(mode)
 
     # Calculate the answer
     #assert check_partitions(partitions)
@@ -270,11 +311,13 @@ if __name__ == "__main__":
     #assert check_partitions(partitions)
     summarized_partitions = summarize_activity(partitions, max_inactive, min_active)
 
-    if mode in ("INVERT", "SLEEP1"):
+    if mode in ("INVERT", "SLEEP1", "SLEEP"):
         # Note: this below relies on max_ts being NOW, plus this program being run (so inactivity must end NOW, to give us one extra useful time period at the end).
         summarized_partitions = list(invert_activity(summarized_partitions, min_ts, min(now,end_ts)))
     if mode == "SLEEP1":
         summarized_partitions = [max(summarized_partitions, key=lambda p: p[1]-p[0])]
+    elif mode == "SLEEP":
+        summarized_partitions = list(filter_sleep(summarized_partitions, min_ts, min(now,end_ts)))
 
     # Print the answer
     def print_period(start_ts, end_ts, label=None):
@@ -285,5 +328,6 @@ if __name__ == "__main__":
     for start_ts, end_ts, range_type in summarized_partitions:
         label = { RANGE_TYPES.ACTIVITY: "Active"
                 , RANGE_TYPES.NO_ACTIVITY: "Inactive"
-                , RANGE_TYPES.NOT_RECORDED: "?" }[range_type]
+                , RANGE_TYPES.NOT_RECORDED: "?"
+                , RANGE_TYPES.SLEEP: "Sleep" }[range_type]
         print_period(start_ts, end_ts, label)
